@@ -1,0 +1,115 @@
+name: Publish reviewed SBP workload image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_sha:
+        description: Reviewed full commit SHA on sbp-workload-0.4.38
+        required: true
+        type: string
+      image_tag:
+        description: sbp-workload-0.4.38- followed by the first 12 characters of ref_sha
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: sbp-workload-image-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'mamenesia/nakama' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: ghcr.io/mamenesia/nakama
+      REF_SHA: ${{ inputs.ref_sha }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+    steps:
+      - name: Validate immutable source and tag inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REF_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_TAG" == "sbp-workload-0.4.38-${REF_SHA:0:12}" ]]
+
+      - name: Checkout reviewed source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source identity, allowed branch and release base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REF_SHA"
+          git fetch --no-tags https://github.com/mamenesia/nakama.git \
+            refs/heads/sbp-workload-0.4.38:refs/remotes/origin/sbp-workload-0.4.38
+          git merge-base --is-ancestor "$REF_SHA" refs/remotes/origin/sbp-workload-0.4.38
+          git merge-base --is-ancestor ce5ae048ac92c16639d5a368e128befdc07a079d "$REF_SHA"
+          test -f Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Log in to GHCR with this job's package permission
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse an existing or unverifiable image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG" > /tmp/image-inspect 2>&1; then
+            echo 'Refusing to overwrite an existing image tag.' >&2
+            exit 1
+          fi
+          # Do not interpret network/auth failures as an absent tag.
+          if ! grep -qi 'manifest unknown' /tmp/image-inspect \
+            && ! grep -Fq "$IMAGE:$IMAGE_TAG: not found" /tmp/image-inspect; then
+            echo 'Cannot prove the image tag is absent; publication stopped.' >&2
+            exit 1
+          fi
+
+      - name: Build and publish exactly one custom tag
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/mamenesia/nakama:${{ inputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/mamenesia/nakama
+            org.opencontainers.image.revision=${{ inputs.ref_sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record digest and source identity
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" >/dev/null
+          printf 'Source: `%s`\n\nImage: `%s:%s`\n\nPin: `%s@%s`\n' \
+            "$REF_SHA" "$IMAGE" "$IMAGE_TAG" "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s@%s\n' "$IMAGE" "$DIGEST" > image-digest.txt
+
+      - name: Retain deployment identity
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbp-workload-image-digest
+          path: image-digest.txt
+          if-no-files-found: error
