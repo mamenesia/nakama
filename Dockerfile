@@ -45,7 +45,7 @@ RUN mkdir -p /runtime-deps \
 FROM oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61 AS runtime
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates sudo python3 \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates sudo python3 util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 # Optional Google Meet audio-capture runtime. Chromium remains sandboxed and
@@ -114,6 +114,22 @@ RUN test -f apps/server/src/services/javascript-tool-runner.js \
   && test -f apps/server/src/services/plugin-runner.js \
   && test -f node_modules/pm2/bin/pm2-runtime
 
+# Dedicated-instance hardening: no set-ID elevation, including optional packages.
+# Check after every install/copy; fail closed if a future image adds file caps.
+RUN find / -xdev \( -type f -o -type d \) -perm /6000 -print -exec chmod a-s {} +
+RUN python3 - <<'PY'
+import os
+def fail(error):
+    raise error
+for root, dirs, files in os.walk('/', onerror=fail):
+    if root == '/':
+        dirs[:] = [d for d in dirs if d not in ('proc', 'sys', 'dev')]
+    for name in dirs + files:
+        path = os.path.join(root, name)
+        assert not os.lstat(path).st_mode & 0o6000, path
+        assert 'security.capability' not in os.listxattr(path, follow_symlinks=False), path
+PY
+
 ENV NODE_ENV=production \
     NAKAMA_HOST=0.0.0.0 \
     NAKAMA_PORT=4310 \
@@ -128,7 +144,11 @@ VOLUME ["/nakama/data"]
 
 USER 1000
 
+# Preserve the Bun base's argument handling, under inherited no-new-privileges.
+ENTRYPOINT ["/usr/bin/setpriv", "--no-new-privs", "--", "/usr/local/bin/docker-entrypoint.sh"]
+
+# Docker healthchecks do not pass through ENTRYPOINT.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD bun -e "fetch('http://127.0.0.1:4310/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  CMD /usr/bin/setpriv --no-new-privs -- bun -e "fetch('http://127.0.0.1:4310/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["bun", "run", "apps/server/dist/index.js"]

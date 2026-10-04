@@ -147,10 +147,11 @@ OpenRouter provider/model/routing. Expected stored model is exactly
 `https://openrouter.ai/api/v1/chat/completions`. Changing those constants requires
 a reviewed extension rebuild; caller/config drift fails closed. No new
 database migrations, settings writes or production variables beyond the key-file
-path. An enabled key-file mount must be a directory read-only bind mount, not
-a single-file bind mount, so atomic file replacement becomes visible inside the
+path. An enabled key-file mount must be a directory bind mount, not a single-file
+bind mount, so atomic file replacement becomes visible inside the
 container. The loader rejects symlinks, special files and group/world-writable
-files. Operator must additionally enforce parent-directory and owner permissions.
+files. Prefer read-only; the conditional DAC alternative and required image/
+parent-directory/owner controls are specified in the privilege-boundary section.
 
 Deployment is gated on independent base/hash review, focused and combined tests,
 security review, built-container smoke, actual synthetic provider evidence and
@@ -217,16 +218,62 @@ docker buildx build --platform linux/amd64 --load \
   -t "ghcr.io/mamenesia/nakama:$TAG" .
 ```
 
-Use the existing Dockerfile without new build secrets. The local verification
-build used `--build-arg OMNI_VERSION=` to omit optional Omni; workload execution
-never invokes Omni. Record this argument in provenance and use the same argument
-for the reviewed production image if that is the accepted artifact. With an
-authorized registry publisher, replace `--load` with `--push --provenance=mode=max
+Use the existing Dockerfile without new build secrets or build-argument overrides.
+The reviewed default build includes Omni0.7.9; workload execution never invokes
+Omni. With an authorized registry publisher, replace `--load` with `--push --provenance=mode=max
 --sbom=true`. Publish exactly the one custom tag. Record manifest-list and
 linux/amd64 manifest digests, attestations, revision/source/version labels and
 SBOM. Never mistake inherited Bun-base image labels for source provenance.
 Package version stays upstream0.4.38; custom OCI version/tag identifies the
 extension. Registry publication/attestation availability is not verified here.
+
+### Dedicated-image privilege boundary and key mount
+
+The final rootfs strips all SUID/SGID bits after installs and copies. Its build
+fails if any set-ID bit or file capability remains. The image keeps `USER 1000`.
+`setpriv --no-new-privs` runs before the unchanged Bun base entrypoint, preserving
+its command/argument handling and `exec` behavior. PID1 and its descendants
+inherit irreversible `NoNewPrivs: 1`. The Docker healthcheck uses the same
+`setpriv` boundary because Docker does not run healthchecks through ENTRYPOINT.
+`docker exec` also bypasses ENTRYPOINT: it is a trusted operator action, not a
+way to measure the server's inherited state. Inspect actual PID1/server children.
+
+Prefer a kernel read-only key-directory bind. If the orchestrator cannot persist
+it, a normal rw bind is conditional on **all** these deployment gates:
+
+- Host parent root:root0700; key directory root:1000 mode0750; JSON root:1000
+  mode0440. Bind the directory at `/run/sbp-nakama-keys`, not a single file.
+  Image `/run` remains root:root0755. No other workload can write the host paths.
+- Capture the deployed image digest, actual entrypoint/arguments, UID/GID1000,
+  and process status: PID1 and server descendants NNP1, permitted/effective/
+  ambient capabilities zero. Dokploy command/entrypoint overrides must be absent
+  or exactly the reviewed launcher. Do not accept an override that bypasses it.
+- No privileged mode, Docker socket, host devices, extra capabilities or
+  unreviewed executable mounts. Scan the exact published rootfs for set-ID files
+  and file capabilities. This image cannot protect against an operator changing
+  its user, entrypoint or capabilities. No kernel/runtime exploit claim is made.
+- Verify UID1000 can read but cannot overwrite, append, rename, unlink, create,
+  chmod, chown or replace the key file/directory. Test host-root atomic rotation
+  through the directory bind and require current/next/revoked changes on reopen.
+- Host root writes a temporary file in that directory, sets ownership/mode,
+  fsyncs it, renames over `keys.json`, then fsyncs the directory. The loader opens
+  it anew per request. Do not loosen permissions or replace the mount directory.
+
+DAC is **not** a kernel read-only mount. It protects against ordinary UID1000
+mutations under these gates, not host root or a compromised kernel. The default
+capability bounding set can remain nonzero; without permitted/effective/ambient
+caps, file caps or set-ID elevation, it is not an active privilege grant. Persisted
+`cap_drop: ALL` and `no-new-privileges:true` remain preferable defense in depth
+when the orchestrator supports them; this image does not depend on their support.
+
+Compatibility tradeoffs: `sudo`, `su`, `mount` and other former set-ID helpers
+cannot elevate; package installs and tools requiring elevation will fail. This
+is intentional for the dedicated instance. Optional Meet/Chromium sandbox flows
+requiring a set-ID helper are not verified and must not be enabled without
+separate review. Do not disable the browser sandbox to work around this policy.
+There are no API, environment, schema or storage-format changes in this image
+hardening. Official0.4.38 rollback uses the same data volume; its image does not
+retain this privilege boundary, so remove the workload key mount on rollback.
 
 Before production stop, the source runner must:
 
@@ -248,7 +295,8 @@ Before production stop, the source runner must:
    stopped-volume backup** of `orison-nakama-data`, verify archive/hash and a
    disposable restore/integrity drill, then proceed. Never transfer this backup
    into an Amp bundle or use the old0.4.37 archive as an automatic downgrade.
-6. Add the read-only external key directory mount/path, configure SBP's new
+6. Add the external key directory mount/path (read-only preferred; otherwise
+   pass every DAC/image gate above), configure SBP's new
    credential privately, and pin only this service to the reviewed custom digest
    retaining `/nakama/data` and its existing volume. Start and verify health,
    real synthetic search/evidence, wrong-key rejection, deadline/cancellation,
@@ -257,7 +305,7 @@ Before production stop, the source runner must:
 
 Rollback: stop only the dedicated service; restore the recaptured official
 0.4.38 digest and pre-rollout service configuration using **the same volume**.
-Remove the workload key-path env/read-only mount; revert SBP adapter activation
+Remove the workload key-path env/key mount; revert SBP adapter activation
 to its pre-rollout configuration (legacy integration may remain unavailable—do
 not represent rollback as restoring the retired key API). No down migration,
 volume restore, or data deletion. Start official0.4.38, verify image/digest,
