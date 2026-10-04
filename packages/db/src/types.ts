@@ -81,6 +81,18 @@ export interface StoredWorkflowRunStepRecord {
   stepId: string;
 }
 
+/** Metadata-only admission check; deliberately excludes prompt and user data. */
+export interface ProfileExecutionScope {
+  composioCount: number;
+  id: string;
+  isSuper: boolean;
+  mcpCount: number;
+  model: string | null;
+  orgId: string;
+  skillCount: number;
+  tools: { name: string; handlerType: string; orgId: string | null }[];
+}
+
 export interface StoredProfileRecord {
   /** Defaults to enabled when absent for legacy in-memory records. */
   automationsEnabled?: boolean;
@@ -933,6 +945,10 @@ export interface DatabaseAdapter {
     version: string
   ): Promise<StoredPluginReleaseRecord | null>;
   getProfile(id: string): Promise<StoredProfileRecord | null>;
+  getProfileExecutionScope(
+    id: string,
+    orgId: string
+  ): Promise<ProfileExecutionScope | null>;
   getProfileForOrg(
     id: string,
     orgId: string

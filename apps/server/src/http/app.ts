@@ -9,6 +9,8 @@ import { bodyLimit } from "hono/body-limit";
 import { requestId } from "hono/request-id";
 import { sessionTurnRegistry } from "../services/session-turn-registry";
 import { tryServeStaticWeb } from "../static-web";
+import { SbpError } from "../workloads/sbp-contract";
+import { createSbpRun } from "../workloads/sbp-run";
 import { createAuditLogMiddleware } from "./audit-log";
 import { createAuthMiddleware } from "./auth-middleware";
 import type { ServerOptions } from "./context";
@@ -40,6 +42,7 @@ import { registerPlatformOrgRoutes } from "./routes/platform-orgs";
 import { registerPluginRoutes } from "./routes/plugins";
 import { registerProfilePortabilityRoutes } from "./routes/profile-portability";
 import { registerProfileRoutes } from "./routes/profiles";
+import { registerSbpWorkloadRoute } from "./routes/sbp-workload";
 import { registerSessionRoutes } from "./routes/sessions";
 import { registerSetupImportRoutes } from "./routes/setup-import";
 import { registerSkillProposalRoutes } from "./routes/skill-proposals";
@@ -112,6 +115,22 @@ export function createHonoApp(options: ServerOptions) {
         }
       : undefined,
   };
+  registerSbpWorkloadRoute(app, {
+    async run(query, signal) {
+      if (restoringData || restorePending || !options.databaseAdapter) {
+        throw new SbpError("unavailable");
+      }
+      activeDataRequests += 1;
+      try {
+        return await createSbpRun({
+          database: options.databaseAdapter,
+          getUserConfig: () => options.agent.getUserConfig(),
+        })(query, signal);
+      } finally {
+        activeDataRequests -= 1;
+      }
+    },
+  });
   app.use("*", async (c, next) => {
     if (restoringData) {
       return errorResponse(

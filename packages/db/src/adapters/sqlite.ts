@@ -17,6 +17,7 @@ import type {
   DatabaseAdapter,
   OrgMemoryProposalStatus,
   PluginPublishResult,
+  ProfileExecutionScope,
   PublishOrgPluginReleaseInput,
   StoredArtifactShareRecord,
   StoredAttachmentRecord,
@@ -731,6 +732,17 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
   const getProfileForOrgStmt = db.prepare(
     "SELECT * FROM profiles WHERE id = ? AND org_id = ?"
   );
+  // A single snapshot reads admission metadata only, never prompt, skill text,
+  // tool configuration, sessions, or retired app-user records.
+  const getProfileExecutionScopeStmt = db.prepare(`
+    SELECT p.id, p.org_id AS orgId, p.is_super AS isSuper, p.model,
+      (SELECT COUNT(*) FROM profile_mcp_servers WHERE profile_id = p.id) AS mcpCount,
+      (SELECT COUNT(*) FROM profile_skills WHERE profile_id = p.id) AS skillCount,
+      (SELECT COUNT(*) FROM profile_composio_toolkits WHERE profile_id = p.id) AS composioCount,
+      (SELECT json_group_array(json_object('name', t.name, 'handlerType', t.handler_type, 'orgId', t.org_id))
+       FROM profile_tools pt JOIN tools t ON t.id = pt.tool_id WHERE pt.profile_id = p.id) AS tools
+    FROM profiles p WHERE p.id = ? AND p.org_id = ?
+  `);
   const getDefaultProfileForOrgStmt = db.prepare(
     "SELECT * FROM profiles WHERE org_id = ? AND is_default = 1 LIMIT 1"
   );
@@ -3509,6 +3521,18 @@ function createSqliteDatabaseAdapter(db: Database): DatabaseAdapter {
     async getProfile(id) {
       const row = getProfileStmt.get(id) as ProfileRow | null;
       return row ? toProfileRecord(row) : null;
+    },
+
+    async getProfileExecutionScope(id, orgId) {
+      const row = getProfileExecutionScopeStmt.get(id, orgId) as
+        | (Omit<ProfileExecutionScope, "tools" | "isSuper"> & {
+            tools: string;
+            isSuper: number;
+          })
+        | null;
+      return row
+        ? { ...row, isSuper: row.isSuper === 1, tools: JSON.parse(row.tools) }
+        : null;
     },
 
     async getProfileForOrg(id, orgId) {
